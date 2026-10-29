@@ -2,7 +2,8 @@
 # License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl).
 from __future__ import annotations
 
-from odoo.http import STATIC_CACHE_LONG, Response, Stream, request
+from odoo.http import Response, request
+from odoo.http.stream import STATIC_CACHE_LONG, Stream
 
 from .models.ir_attachment import IrAttachment
 
@@ -15,6 +16,14 @@ except ImportError:
 
 class FsStream(Stream):
     fs_attachment = None
+
+    def __init__(self, **kwargs):
+        # Odoo 20 only accepts the 'data', 'path' and 'url' types
+        if kwargs.get("type") == "fs":
+            self.from_path = None
+            self.__dict__.update(kwargs)
+            return
+        super().__init__(**kwargs)
 
     @classmethod
     def from_fs_attachment(cls, attachment: IrAttachment) -> FsStream:

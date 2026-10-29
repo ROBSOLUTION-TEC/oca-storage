@@ -109,7 +109,7 @@ class TestAttachmentInDBFileLikeAdapter(
 
     def setUp(self):
         super().setUp()
-        self.env["ir.config_parameter"].sudo().set_param("ir_attachment.location", "db")
+        self.env["ir.config_parameter"].sudo().set_str("ir_attachment.location", "db")
         self.prepare()
 
     def tearDown(self) -> None:
@@ -133,9 +133,7 @@ class TestAttachmentInFileFileLikeAdapter(
 
     def setUp(self):
         super().setUp()
-        self.env["ir.config_parameter"].sudo().set_param(
-            "ir_attachment.location", "file"
-        )
+        self.env["ir.config_parameter"].sudo().set_str("ir_attachment.location", "file")
         self.prepare()
 
     def tearDown(self) -> None:

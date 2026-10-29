@@ -9,6 +9,7 @@ import logging
 import mimetypes
 import os
 import re
+import shutil
 import time
 from contextlib import closing, contextmanager
 from pathlib import Path
@@ -17,10 +18,10 @@ import fsspec
 import psycopg2
 from slugify import slugify
 
-import odoo
 from odoo import api, fields, models
 from odoo.exceptions import AccessError, UserError
 from odoo.fields import Domain
+from odoo.tools.binary import BinaryValue
 
 from .strtobool import strtobool
 
@@ -219,8 +220,8 @@ class IrAttachment(models.Model):
             if mimetype.startswith(mimetype_key):
                 if not limit:
                     return True
-                bin_data = data
-                return len(bin_data) <= limit
+                size = data.size if isinstance(data, BinaryValue) else len(data)
+                return size <= limit
         return False
 
     def _get_datas_related_values(self, data, mimetype):
@@ -239,7 +240,7 @@ class IrAttachment(models.Model):
                 )
             else:
                 # Uses the full object storage path; standard Odoo uses a relative path.
-                path = self._get_fs_path(storage, data)
+                path = self._get_fs_path_for_key(storage, values["checksum"])
                 values.update(
                     {
                         "store_fname": f"{storage}://{path}",
@@ -259,18 +260,6 @@ class IrAttachment(models.Model):
             # If not, we use the default storage configured into odoo
             storage = super()._storage()
         return storage
-
-    @api.depends("store_fname", "db_datas")
-    def _compute_raw(self):
-        """Always expose raw payload as bytes.
-
-        Some callers (e.g. account EDI helpers) slice the value returned by
-        ``raw`` and crash when it is ``False`` for 0-byte attachments.
-        """
-        res = super()._compute_raw()
-        false_attachments = self.filtered(lambda att: not att.raw)
-        false_attachments.raw = b""
-        return res
 
     @api.model_create_multi
     def create(self, vals_list):
@@ -297,22 +286,27 @@ class IrAttachment(models.Model):
                 vals_list_no_model.append(vals)
         atts = super().create(vals_list_no_model)
         attachments |= atts
-        attachments._enforce_meaningful_storage_filename()
+        if not self.env.context.get("ir_attachment_from_stream"):
+            # _upload_file writes the file after the creation: renamed there
+            attachments._enforce_meaningful_storage_filename()
         return attachments
+
+    def _upload_file(self, file, create_vals):
+        attachment = super()._upload_file(file, create_vals)
+        attachment._enforce_meaningful_storage_filename()
+        return attachment
 
     def write(self, vals):
         if not self:
             return super().write(vals)
-        if ("datas" in vals or "raw" in vals) and not (
-            "name" in vals or "mimetype" in vals
-        ):
+        if "raw" in vals and not ("name" in vals or "mimetype" in vals):
             mimetype = self._compute_mimetype(vals)
             if mimetype and mimetype != "application/octet-stream":
                 vals["mimetype"] = mimetype
             else:
                 # When we write on an attachment, if the mimetype is not provided, it
                 # will be computed from the name. The problem is that if you assign a
-                # value to the field ``datas`` or ``raw``, the name is not provided
+                # value to the field ``raw``, the name is not provided
                 # nor the mimetype, so the mimetype will be set to ``application/octet-
                 # stream``.
                 # We want to avoid this, so we take the mimetype of the first attachment
@@ -348,20 +342,24 @@ class IrAttachment(models.Model):
         return True
 
     @api.model
-    def _file_read(self, fname, size=None):
-        if self._is_file_from_a_storage(fname):
-            return self._storage_file_read(fname, size)
-        else:
-            return super()._file_read(fname, size)
+    def _file_fname(self, sha):
+        """Path of a new file (Odoo 20 hook used by ``_upload_file``)"""
+        storage = self.env.context.get("storage_location") or self._storage()
+        if storage in self._get_storage_codes():
+            return f"{storage}://{self._get_fs_path_for_key(storage, sha)}"
+        return super()._file_fname(sha)
+
+    def _file_read(self):
+        if self._is_file_from_a_storage(self.store_fname):
+            return FsBinaryFile(self)
+        return super()._file_read()
 
     @api.model
-    def _file_write(self, bin_data, checksum):
-        location = self.env.context.get("storage_location") or self._storage()
-        if location in self._get_storage_codes():
-            filename = self._storage_file_write(bin_data)
-        else:
-            filename = super()._file_write(bin_data, checksum)
-        return filename
+    def _file_write(self, fname, bin_value):
+        if self._is_file_from_a_storage(fname):
+            self._storage_file_write(fname, bin_value)
+            return
+        super()._file_write(fname, bin_value)
 
     @api.model
     def _file_delete(self, fname) -> None:  # pylint: disable=missing-return
@@ -378,8 +376,9 @@ class IrAttachment(models.Model):
         else:
             super()._file_delete(fname)
 
-    def _set_attachment_data(self, asbytes) -> None:  # pylint: disable=missing-return
-        super()._set_attachment_data(asbytes)
+    def _inverse_raw(self):
+        # Odoo 20: replaces the former _set_attachment_data hook
+        super()._inverse_raw()
         self._enforce_meaningful_storage_filename()
 
     ##############################################
@@ -402,20 +401,19 @@ class IrAttachment(models.Model):
         return {}
 
     @api.model
-    def _storage_file_write(self, bin_data: bytes) -> str:
-        """Write the file to the filesystem storage"""
-        storage = self.env.context.get("storage_location") or self._storage()
-        fs = self._get_fs_storage_for_code(storage)
-        path = self._get_fs_path(storage, bin_data)
+    def _storage_file_write(self, fname: str, bin_value: io.IOBase) -> None:
+        """Write the content of ``bin_value`` (a readable IO) under ``fname``
+        (``<storage code>://<path>``) in the filesystem storage"""
+        fs, _storage, path = self._fs_parse_store_fname(fname)
         dirname = os.path.dirname(path)
-        if not fs.exists(dirname):
+        if dirname and not fs.exists(dirname):
             fs.makedirs(dirname)
-        fname = f"{storage}://{path}"
         kwargs = self._storage_write_option(fs)
+        if hasattr(bin_value, "seek"):
+            bin_value.seek(0)
         with fs.open(path, "wb", **kwargs) as f:
-            f.write(bin_data)
+            shutil.copyfileobj(bin_value, f)
         self._fs_mark_for_gc(fname)
-        return fname
 
     @api.model
     def _storage_file_delete(self, fname):
@@ -428,11 +426,15 @@ class IrAttachment(models.Model):
         self._fs_mark_for_gc(fname)
 
     @api.model
-    def _get_fs_path(self, storage_code: str, bin_data: bytes) -> str:
+    def _get_fs_path(self, storage_code: str, bin_data) -> str:
         """Compute the path to store the file in the filesystem storage"""
-        key = self.env.context.get("force_storage_key")
-        if not key:
-            key = self._compute_checksum(bin_data)
+        return self._get_fs_path_for_key(storage_code, self._compute_checksum(bin_data))
+
+    @api.model
+    def _get_fs_path_for_key(self, storage_code: str, key: str) -> str:
+        """Compute the path of the file named ``key`` (the checksum by
+        default) in the filesystem storage"""
+        key = self.env.context.get("force_storage_key") or key
         if self.env["fs.storage"]._must_optimize_directory_path(storage_code):
             # Generate a unique directory path based on the file's hash
             key = os.path.join(key[:2], key[2:4], key)
@@ -508,7 +510,6 @@ class IrAttachment(models.Model):
             # we need to update the store_fname with the new filename by
             # calling the write method of the field since the write method
             # of ir_attachment prevent normal write on store_fname
-            # flake8: noqa: E231
             attachment._force_write_store_fname(f"{storage}://{new_filename_with_path}")
             self._fs_mark_for_gc(attachment.store_fname)
 
@@ -681,8 +682,7 @@ class IrAttachment(models.Model):
         Using a new Odoo Environment thus a new PG transaction.
         """
         if new_cr:
-            registry = odoo.modules.registry.Registry.new(self.env.cr.dbname)
-            with closing(registry.cursor()) as cr:
+            with closing(self.env.registry.cursor()) as cr:
                 try:
                     yield self.env(cr=cr)
                 except Exception:
@@ -743,7 +743,7 @@ class IrAttachment(models.Model):
             _logger.info("moving %s on the object storage", fname)
             self.write(
                 {
-                    "datas": self.datas,
+                    "raw": self.raw,
                     # this is required otherwise the
                     # mimetype gets overriden with
                     # 'application/octet-stream'
@@ -755,7 +755,7 @@ class IrAttachment(models.Model):
             return self._full_path(fname)
         elif self.db_datas:
             _logger.info("moving on the object storage from database")
-            self.write({"datas": self.datas})
+            self.write({"raw": self.raw, "mimetype": self.mimetype})
 
     @api.model
     def force_storage(self):
@@ -834,19 +834,21 @@ class IrAttachment(models.Model):
             for attachment_id in attachment_ids:
                 current += 1
                 # if we browse attachments outside of the loop, the first
-                # access to 'datas' will compute all the 'datas' fields at
+                # access to 'raw' will compute all the 'raw' fields at
                 # once, which means reading hundreds or thousands of files at
                 # once, exhausting memory
                 attachment = model_env.browse(attachment_id)
-                # this write will read the datas from the Object Storage and
+                # this write will read the data from the Object Storage and
                 # write them back in the DB (the logic for location to write is
-                # in the 'datas' inverse computed field)
+                # in the 'raw' inverse computed field)
                 # we need to write the mimetype too, otherwise it will be
                 # overwritten with 'application/octet-stream' on assets. On each
                 # write, the mimetype is recomputed if not given. If we don't
                 # pass it nor the name, the mimetype will be set to the default
                 # value 'application/octet-stream' on assets.
-                attachment.write({"datas": attachment.datas})
+                attachment.write(
+                    {"raw": attachment.raw, "mimetype": attachment.mimetype}
+                )
                 if current % 100 == 0 or total - current == 0:
                     _logger.info(
                         "attachment %s/%s after %.2fs",
@@ -897,7 +899,7 @@ class IrAttachment(models.Model):
                             log_exceptions=False,
                         )
 
-                        # This is a trick to avoid having the 'datas'
+                        # This is a trick to avoid having the 'raw'
                         # function fields computed for every attachment on
                         # each iteration of the loop. The former issue
                         # being that it reads the content of the file of
@@ -1099,10 +1101,12 @@ class AttachmentFileLikeAdapter:
             # content and checksum to avoid collision.
             content = self._gen_random_content()
             checksum = self.attachment._compute_checksum(content)
-            new_store_fname = self.attachment.with_context(
+            attachment = self.attachment.with_context(
                 attachment_res_model=self.attachment.res_model,
                 attachment_res_field=self.attachment.res_field,
-            )._file_write(content, checksum)
+            )
+            new_store_fname = attachment._file_fname(checksum)
+            attachment._file_write(new_store_fname, io.BytesIO(content))
             if self.attachment._is_file_from_a_storage(new_store_fname):
                 (
                     filesystem,
@@ -1173,7 +1177,7 @@ class AttachmentFileLikeAdapter:
     def _ensure_cache_consistency(self):
         """Ensure the cache consistency once the file is closed"""
         if self._is_open_for_modify and not self._is_stored_in_db:
-            self.attachment.invalidate_recordset(fnames=["raw", "datas", "db_datas"])
+            self.attachment.invalidate_recordset(fnames=["raw", "db_datas"])
         if (
             self.attachment.res_model
             and self.attachment.res_id
@@ -1206,3 +1210,57 @@ class AttachmentFileLikeAdapter:
         if not self._file:
             self.__enter__()
         return getattr(self._file, attr)
+
+
+class FsBinaryFile(BinaryValue):
+    """Lazily loaded content of an attachment stored in a filesystem storage
+    (Odoo 20 ``raw`` value, like ``LocalBinaryFile`` for the local filestore)"""
+
+    __slots__ = (
+        "__checksum",
+        "__content",
+        "__fname",
+        "__size",
+        "_attachment",
+        "filename",
+    )
+
+    def __init__(self, attachment: IrAttachment):
+        self._attachment = attachment
+        self.__fname = attachment.store_fname
+        self.__checksum = attachment.checksum
+        self.__size = attachment.file_size
+        self.__content = None
+        self.filename = attachment.name
+
+    def open(self):
+        if self.__content is not None:
+            return super().open()
+        fs, storage, path = self._attachment._fs_parse_store_fname(self.__fname)
+        try:
+            return fs.open(path, "rb")
+        except OSError:
+            _logger.info("Error reading %s on storage %s", path, storage, exc_info=True)
+            return io.BytesIO(b"")
+
+    @property
+    def content(self) -> bytes:
+        if self.__content is None:
+            self.__content = self._attachment._storage_file_read(self.__fname) or b""
+        return self.__content
+
+    @property
+    def size(self):
+        if self.__content is None and self.__size is not None:
+            return self.__size
+        return len(self.content)
+
+    @property
+    def checksum(self):
+        return self.__checksum or super().checksum
+
+    def __bool__(self):
+        return bool(self.size)
+
+    def __repr__(self):
+        return f"FsBinaryFile({self.__fname!r})"
