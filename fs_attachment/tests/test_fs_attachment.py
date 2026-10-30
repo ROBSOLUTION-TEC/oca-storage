@@ -475,7 +475,7 @@ class TestFSAttachment(TestFSAttachmentCommon):
         self.assertEqual(attachment1.name, "test.txt")
         self.assertEqual(attachment2.name, "test.txt")
         self.assertNotEqual(attachment1.store_fname, attachment2.store_fname)
-        self.assertEqual(bytes(attachment1.raw), attachment2.raw)
+        self.assertEqual(bytes(attachment1.raw), bytes(attachment2.raw))
 
         attachment1.raw = b"new content"
         self.assertNotEqual(attachment1.raw, attachment2.raw)
@@ -499,7 +499,7 @@ class TestFSAttachment(TestFSAttachmentCommon):
         self.assertEqual(len(res2), 1)
 
         self.assertNotEqual(res[0].store_fname, res2[0].store_fname)
-        self.assertEqual(bytes(res[0].raw), res2[0].raw)
+        self.assertEqual(bytes(res[0].raw), bytes(res2[0].raw))
 
     def test_update_png_to_svg(self):
         b64_data_png = (

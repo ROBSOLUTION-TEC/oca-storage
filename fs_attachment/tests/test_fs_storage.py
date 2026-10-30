@@ -249,7 +249,7 @@ class TestFsStorage(TestFSAttachmentCommon):
         self.ir_attachment_model.create(
             {
                 "name": "field.txt",
-                "raw": "Attachment linked to a field",
+                "raw": b"Attachment linked to a field",
                 "res_model": "res.partner",
                 "res_field": "name",
             }
@@ -257,7 +257,7 @@ class TestFsStorage(TestFSAttachmentCommon):
         self.ir_attachment_model.create(
             {
                 "name": "no_field.txt",
-                "raw": "Attachment not linked to a field",
+                "raw": b"Attachment not linked to a field",
             }
         )
         self.env.flush_all()

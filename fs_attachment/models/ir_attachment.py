@@ -441,7 +441,7 @@ class IrAttachment(models.Model):
         # Generate a unique directory path based on the file's hash
         return key
 
-    def _build_fs_filename(self):
+    def _build_fs_filename(self, version=None):
         """Build the filename to store in the filesystem storage
 
         The filename is computed from the name, the extension and a version
@@ -457,11 +457,12 @@ class IrAttachment(models.Model):
         filename, extension = os.path.splitext(self.name)
         if not extension:
             extension = mimetypes.guess_extension(self.mimetype)
-        version = 0
-        if self.fs_filename:
-            parsed = self._parse_fs_filename(self.fs_filename)
-            if parsed:
-                version = parsed[2] + 1
+        if version is None:
+            version = 0
+            if self.fs_filename:
+                parsed = self._parse_fs_filename(self.fs_filename)
+                if parsed:
+                    version = parsed[2] + 1
         return "{}{}".format(
             slugify(
                 f"{filename}-{self.id}-{version}",
@@ -490,6 +491,10 @@ class IrAttachment(models.Model):
             if self.env["fs.storage"]._must_use_filename_obfuscation(storage):
                 attachment.fs_filename = filename
                 continue
+            if attachment._is_meaningful_fs_filename(filename):
+                # Odoo 20 may run the raw inverse more than once for a
+                # write: already renamed, keep the version
+                continue
             new_filename = attachment._build_fs_filename()
             # we must keep the same full path as the original filename
             new_filename_with_path = os.path.join(
@@ -512,6 +517,15 @@ class IrAttachment(models.Model):
             # of ir_attachment prevent normal write on store_fname
             attachment._force_write_store_fname(f"{storage}://{new_filename_with_path}")
             self._fs_mark_for_gc(attachment.store_fname)
+
+    def _is_meaningful_fs_filename(self, filename):
+        """The file already has the name built for the attachment"""
+        self.ensure_one()
+        basename = os.path.basename(filename)
+        if not self.fs_filename or basename != self.fs_filename:
+            return False
+        parsed = self._parse_fs_filename(basename)
+        return bool(parsed) and basename == self._build_fs_filename(parsed[2])
 
     def _force_write_store_fname(self, store_fname):
         """Force the write of the store_fname field
@@ -1078,6 +1092,7 @@ class AttachmentFileLikeAdapter:
             elif self.attachment.store_fname:
                 filepath = self.attachment._full_path(self.attachment.store_fname)
                 filesystem = fsspec.filesystem("file")
+                self._make_local_file_writable(filepath)
             else:
                 filepath = f"{self.attachment.id}"
                 filesystem = fsspec.filesystem("memory")
@@ -1118,6 +1133,7 @@ class AttachmentFileLikeAdapter:
                 new_filepath = self.attachment._full_path(new_store_fname)
                 old_filepath = self.attachment._full_path(self.attachment.store_fname)
                 filesystem = fsspec.filesystem("file")
+                self._make_local_file_writable(new_filepath)
             if "a" in self.mode:
                 filesystem.cp_file(old_filepath, new_filepath)
             the_file = filesystem.open(
@@ -1131,6 +1147,12 @@ class AttachmentFileLikeAdapter:
         self._filesystem = filesystem
         self._new_store_fname = new_store_fname
         self._file = the_file
+
+    def _make_local_file_writable(self, filepath):
+        """Odoo 20 writes the filestore files read-only (0o444): give the
+        write permission back when the file is opened to be modified."""
+        if self._is_open_for_modify and os.path.exists(filepath):
+            os.chmod(filepath, 0o644)
 
     def _gen_random_content(self, size=256):
         """Generate a random content of size bytes"""

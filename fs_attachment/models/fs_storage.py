@@ -309,15 +309,17 @@ class FsStorage(models.Model):
         attachments._compute_fs_url()
         attachments._compute_fs_url_path()
 
-    @api.model
-    def _setup_complete(self):
+    def _register_hook(self):
         # Force recompute of base_url_for_files.
         # This is needed when {db_name} is used in directory path.
         # Due to the use of server_environment, there is no directory_path column to
         # filter so recompute all.
+        # Odoo 20: _setup_complete() no longer exists, done once the registry
+        # is loaded.
+        res = super()._register_hook()
         self.env.cr.execute(SQL("SELECT id FROM %s", SQL.identifier(self._table)))
         records = self.browse(row[0] for row in self.env.cr.fetchall())
         if records:
             self.env.add_to_compute(self._fields["base_url_for_files"], records)
-        # recompute is done at the end of the caller (registry::setup_models)
-        return super()._setup_complete()
+            records.flush_recordset(["base_url_for_files"])
+        return res
