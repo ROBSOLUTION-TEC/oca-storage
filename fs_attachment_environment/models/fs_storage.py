@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 
-from odoo import models
+from odoo import api, models
 
 _logger = logging.getLogger(__name__)
 
@@ -28,3 +28,11 @@ class FSStorage(models.Model):
             }
         )
         return env_fields
+
+    # base_url and the directory are read from the environment (or from the
+    # defaults stored in server_env_defaults): recompute when a default changes
+    @api.depends(
+        "base_url", "is_directory_path_in_url", "directory_path", "server_env_defaults"
+    )
+    def _compute_base_url_for_files(self):
+        return super()._compute_base_url_for_files()
