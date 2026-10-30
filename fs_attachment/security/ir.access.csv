@@ -1,0 +1,2 @@
+id,name,model_id,group_id/id,operation,domain
+fs_file_gc_access_name,fs.file.gc access name,fs.file.gc,base.group_system,crud,

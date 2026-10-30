@@ -15,7 +15,7 @@
     "depends": ["base", "base_sparse_field"],
     "data": [
         "views/fs_storage_view.xml",
-        "security/ir.model.access.csv",
+        "security/ir.access.csv",
         "wizards/fs_test_connection.xml",
     ],
     "external_dependencies": {"python": ["fsspec>=2024.5.0"]},

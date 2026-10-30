@@ -13,7 +13,7 @@
     "depends": ["fs_storage"],
     "website": "https://github.com/OCA/storage",
     "data": [
-        "security/fs_file_gc.xml",
+        "security/ir.access.csv",
         "views/fs_storage.xml",
     ],
     "external_dependencies": {"python": ["python_slugify", "fsspec>=2025.3.0"]},
